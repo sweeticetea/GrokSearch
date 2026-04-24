@@ -115,7 +115,11 @@ def _extra_results_to_sources(
     name="web_search",
     output_schema=None,
     description="""
-    Before using this tool, please use the plan_intent tool to plan the search carefully.
+    Primary tool for any query that needs up-to-date or external information.
+    Use this tool directly for news, current events, prices, sports, releases, and any question that cannot be answered safely from memory.
+    Do NOT answer realtime questions from memory when this tool is available.
+    plan_intent is optional and should be used only for complex multi-step research, not as a mandatory prerequisite.
+
     Performs a deep web search based on the given query and returns Grok's answer directly.
 
     This tool extracts sources if provided by upstream, caches them, and returns:
@@ -205,6 +209,13 @@ async def web_search(
     answer, grok_sources = split_answer_and_sources(grok_result)
     extra = _extra_results_to_sources(tavily_results, firecrawl_results)
     all_sources = merge_sources(grok_sources, extra)
+
+    if not answer.strip() and not all_sources:
+        answer = (
+            "搜索结果为空：上游接口返回了空正文。"
+            "请优先检查当前 `GROK_MODEL`/`GROK_API_URL` 是否真的支持联网搜索，"
+            "以及其 `/chat/completions` 流式返回格式是否兼容。"
+        )
 
     await _SOURCES_CACHE.set(session_id, all_sources)
     return {"session_id": session_id, "content": answer, "sources_count": len(all_sources)}
@@ -660,7 +671,8 @@ async def toggle_builtin_tools(
     name="plan_intent",
     output_schema=None,
     description="""
-    Phase 1 of search planning: Analyze user intent. Call this FIRST to create a session.
+    Optional planning tool for complex multi-step research. Do not use it for simple realtime lookups that can go straight to web_search.
+    Phase 1 of search planning: Analyze user intent. Call this FIRST only when a planning session is actually needed.
     Returns session_id for subsequent phases. Required flow:
     plan_intent → plan_complexity → plan_sub_query(×N) → plan_search_term(×N) → plan_tool_mapping(×N) → plan_execution
 

@@ -2,7 +2,7 @@ import httpx
 import json
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import List, Optional
+from typing import Any, List, Optional
 from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait_random_exponential
 from tenacity.wait import wait_base
 from zoneinfo import ZoneInfo
@@ -171,44 +171,73 @@ class GrokSearchProvider(BaseSearchProvider):
         }
         return await self._execute_stream_with_retry(headers, payload, ctx)
 
+    def _extract_text_from_payload(self, payload: Any) -> str:
+        if isinstance(payload, str):
+            return payload
+
+        if isinstance(payload, list):
+            return "".join(self._extract_text_from_payload(item) for item in payload)
+
+        if not isinstance(payload, dict):
+            return ""
+
+        fragments: list[str] = []
+
+        choices = payload.get("choices")
+        if isinstance(choices, list):
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    continue
+                fragments.append(self._extract_text_from_payload(choice.get("delta")))
+                fragments.append(self._extract_text_from_payload(choice.get("message")))
+
+        for key in ("delta", "text", "content", "message", "output", "response", "item", "part"):
+            if key in payload:
+                fragments.append(self._extract_text_from_payload(payload.get(key)))
+
+        return "".join(fragment for fragment in fragments if fragment)
+
     async def _parse_streaming_response(self, response, ctx=None) -> str:
         content = ""
-        full_body_buffer = [] 
+        raw_lines: list[str] = []
         
         async for line in response.aiter_lines():
             line = line.strip()
             if not line:
                 continue
-            
-            full_body_buffer.append(line)
 
-            # 兼容 "data: {...}" 和 "data:{...}" 两种 SSE 格式
+            raw_lines.append(line)
+
+            json_str = line
             if line.startswith("data:"):
                 if line in ("data: [DONE]", "data:[DONE]"):
                     continue
-                try:
-                    # 去掉 "data:" 前缀，并去除可能的空格
-                    json_str = line[5:].lstrip()
-                    data = json.loads(json_str)
-                    choices = data.get("choices", [])
-                    if choices and len(choices) > 0:
-                        delta = choices[0].get("delta", {})
-                        if "content" in delta:
-                            content += delta["content"]
-                except (json.JSONDecodeError, IndexError):
-                    continue
-                
-        if not content and full_body_buffer:
+                json_str = line[5:].lstrip()
+
             try:
-                full_text = "".join(full_body_buffer)
+                data = json.loads(json_str)
+            except json.JSONDecodeError:
+                continue
+
+            content += self._extract_text_from_payload(data)
+
+        if not content and raw_lines:
+            try:
+                full_text = "".join(
+                    line[5:].lstrip() if line.startswith("data:") else line
+                    for line in raw_lines
+                    if line not in ("data: [DONE]", "data:[DONE]")
+                )
                 data = json.loads(full_text)
-                if "choices" in data and len(data["choices"]) > 0:
-                    message = data["choices"][0].get("message", {})
-                    content = message.get("content", "")
+                content = self._extract_text_from_payload(data)
             except json.JSONDecodeError:
                 pass
-        
-        await log_info(ctx, f"content: {content}", config.debug_enabled)
+
+        if content:
+            await log_info(ctx, f"content: {content}", config.debug_enabled)
+        else:
+            preview = " | ".join(raw_lines[:5])[:1000]
+            await log_info(ctx, f"content empty; raw preview: {preview}", config.debug_enabled)
 
         return content
 
