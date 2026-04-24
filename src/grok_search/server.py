@@ -152,6 +152,11 @@ async def web_search(
         effective_model = model
 
     grok_provider = GrokSearchProvider(api_url, api_key, effective_model)
+    await log_info(
+        None,
+        f"web_search start: session={session_id} model={effective_model} api_url={api_url.rstrip('/')} extra_sources={extra_sources} query={query}",
+        config.debug_enabled,
+    )
 
     # 计算额外信源配额
     has_tavily = bool(config.tavily_api_key)
@@ -168,11 +173,16 @@ async def web_search(
             tavily_count = extra_sources
 
     # 并行执行搜索任务
-    async def _safe_grok() -> str:
+    grok_error: str | None = None
+
+    async def _safe_grok() -> tuple[str, list[dict]]:
+        nonlocal grok_error
         try:
             return await grok_provider.search(query, platform)
-        except Exception:
-            return ""
+        except Exception as e:
+            grok_error = f"{type(e).__name__}: {str(e)}"
+            await log_info(None, f"web_search upstream error: {grok_error}", config.debug_enabled)
+            return "", []
 
     async def _safe_tavily() -> list[dict] | None:
         try:
@@ -196,7 +206,7 @@ async def web_search(
 
     gathered = await asyncio.gather(*coros)
 
-    grok_result: str = gathered[0] or ""
+    grok_result, structured_grok_sources = gathered[0] or ("", [])
     tavily_results: list[dict] | None = None
     firecrawl_results: list[dict] | None = None
     idx = 1
@@ -208,14 +218,27 @@ async def web_search(
 
     answer, grok_sources = split_answer_and_sources(grok_result)
     extra = _extra_results_to_sources(tavily_results, firecrawl_results)
-    all_sources = merge_sources(grok_sources, extra)
+    all_sources = merge_sources(structured_grok_sources, grok_sources, extra)
 
     if not answer.strip() and not all_sources:
-        answer = (
-            "搜索结果为空：上游接口返回了空正文。"
-            "请优先检查当前 `GROK_MODEL`/`GROK_API_URL` 是否真的支持联网搜索，"
-            "以及其 `/chat/completions` 流式返回格式是否兼容。"
-        )
+        if grok_error:
+            answer = (
+                f"搜索失败：上游请求异常（{grok_error}）。"
+                "请优先检查当前 `GROK_API_URL`、`GROK_MODEL`、网络连通性、证书/代理配置，"
+                "以及目标接口是否真的兼容 OpenAI `/chat/completions`。"
+            )
+        else:
+            answer = (
+                "搜索结果为空：上游接口返回了空正文。"
+                "请优先检查当前 `GROK_MODEL`/`GROK_API_URL` 是否真的支持联网搜索，"
+                "以及其 `/chat/completions` 流式返回格式是否兼容。"
+            )
+
+    await log_info(
+        None,
+        f"web_search done: session={session_id} answer_len={len(answer)} sources_count={len(all_sources)} grok_error={grok_error or ''}",
+        config.debug_enabled,
+    )
 
     await _SOURCES_CACHE.set(session_id, all_sources)
     return {"session_id": session_id, "content": answer, "sources_count": len(all_sources)}

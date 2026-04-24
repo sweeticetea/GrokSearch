@@ -67,6 +67,51 @@ def merge_sources(*source_lists: list[dict]) -> list[dict]:
     return merged
 
 
+def extract_sources_from_payload(payload: Any) -> list[dict]:
+    collected: list[dict] = []
+    source_keys = {
+        "sources",
+        "source",
+        "citations",
+        "citation",
+        "references",
+        "reference",
+        "source_cards",
+        "source_card",
+        "citation_cards",
+        "citation_card",
+        "urls",
+        "annotations",
+    }
+
+    def _walk(node: Any, parent_key: str = "") -> None:
+        nonlocal collected
+
+        if isinstance(node, dict):
+            for key in source_keys:
+                if key in node:
+                    collected = merge_sources(collected, _normalize_sources(node[key]))
+
+            looks_like_source_item = (
+                parent_key in source_keys
+                or str(node.get("type", "")).lower().endswith(("citation", "citations", "reference", "references"))
+                or str(node.get("object", "")).lower().endswith(("citation", "reference"))
+            )
+            if looks_like_source_item:
+                collected = merge_sources(collected, _normalize_sources(node))
+
+            for key, value in node.items():
+                _walk(value, key)
+            return
+
+        if isinstance(node, list):
+            for item in node:
+                _walk(item, parent_key)
+
+    _walk(payload)
+    return collected
+
+
 def split_answer_and_sources(text: str) -> tuple[str, list[dict]]:
     raw = (text or "").strip()
     if not raw:

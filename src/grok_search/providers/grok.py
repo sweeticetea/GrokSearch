@@ -10,6 +10,7 @@ from .base import BaseSearchProvider, SearchResult
 from ..utils import search_prompt, fetch_prompt, url_describe_prompt, rank_sources_prompt
 from ..logger import log_info
 from ..config import config
+from ..sources import extract_sources_from_payload, merge_sources
 
 
 def get_local_time_info() -> str:
@@ -125,7 +126,14 @@ class GrokSearchProvider(BaseSearchProvider):
     def get_provider_name(self) -> str:
         return "Grok"
 
-    async def search(self, query: str, platform: str = "", min_results: int = 3, max_results: int = 10, ctx=None) -> List[SearchResult]:
+    async def search(
+        self,
+        query: str,
+        platform: str = "",
+        min_results: int = 3,
+        max_results: int = 10,
+        ctx=None,
+    ) -> tuple[str, list[dict]]:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -151,7 +159,7 @@ class GrokSearchProvider(BaseSearchProvider):
 
         await log_info(ctx, f"platform_prompt: { query + platform_prompt}", config.debug_enabled)
 
-        return await self._execute_stream_with_retry(headers, payload, ctx)
+        return await self._execute_stream_with_retry(headers, payload, ctx, include_sources=True)
 
     async def fetch(self, url: str, ctx=None) -> str:
         headers = {
@@ -191,19 +199,47 @@ class GrokSearchProvider(BaseSearchProvider):
                 fragments.append(self._extract_text_from_payload(choice.get("delta")))
                 fragments.append(self._extract_text_from_payload(choice.get("message")))
 
-        for key in ("delta", "text", "content", "message", "output", "response", "item", "part"):
+        for key in (
+            "delta",
+            "text",
+            "content",
+            "message",
+            "output",
+            "response",
+            "item",
+            "part",
+            "answer",
+            "completion",
+        ):
             if key in payload:
                 fragments.append(self._extract_text_from_payload(payload.get(key)))
 
         return "".join(fragment for fragment in fragments if fragment)
 
-    async def _parse_streaming_response(self, response, ctx=None) -> str:
+    def _is_plain_text_fragment(self, text: str) -> bool:
+        candidate = (text or "").strip()
+        if not candidate:
+            return False
+        if candidate in ("[DONE]", "[done]"):
+            return False
+        if candidate.startswith(("event:", "id:", "retry:")):
+            return False
+        if candidate[0] in ('{', '[', '"'):
+            return False
+        return True
+
+    async def _parse_streaming_response(self, response, ctx=None, include_sources: bool = False) -> str | tuple[str, list[dict]]:
         content = ""
         raw_lines: list[str] = []
-        
+        plain_text_fragments: list[str] = []
+        collected_sources: list[dict] = []
+
         async for line in response.aiter_lines():
             line = line.strip()
             if not line:
+                continue
+
+            if line.startswith("event:"):
                 continue
 
             raw_lines.append(line)
@@ -217,9 +253,13 @@ class GrokSearchProvider(BaseSearchProvider):
             try:
                 data = json.loads(json_str)
             except json.JSONDecodeError:
+                if self._is_plain_text_fragment(json_str):
+                    plain_text_fragments.append(json_str)
                 continue
 
             content += self._extract_text_from_payload(data)
+            if include_sources:
+                collected_sources = merge_sources(collected_sources, extract_sources_from_payload(data))
 
         if not content and raw_lines:
             try:
@@ -230,18 +270,35 @@ class GrokSearchProvider(BaseSearchProvider):
                 )
                 data = json.loads(full_text)
                 content = self._extract_text_from_payload(data)
+                if include_sources:
+                    collected_sources = merge_sources(collected_sources, extract_sources_from_payload(data))
             except json.JSONDecodeError:
                 pass
 
+        if not content and plain_text_fragments:
+            content = "\n".join(plain_text_fragments).strip()
+
         if content:
-            await log_info(ctx, f"content: {content}", config.debug_enabled)
+            await log_info(
+                ctx,
+                f"content: {content} | structured_sources={len(collected_sources)}",
+                config.debug_enabled,
+            )
         else:
             preview = " | ".join(raw_lines[:5])[:1000]
             await log_info(ctx, f"content empty; raw preview: {preview}", config.debug_enabled)
 
+        if include_sources:
+            return content, collected_sources
         return content
 
-    async def _execute_stream_with_retry(self, headers: dict, payload: dict, ctx=None) -> str:
+    async def _execute_stream_with_retry(
+        self,
+        headers: dict,
+        payload: dict,
+        ctx=None,
+        include_sources: bool = False,
+    ) -> str | tuple[str, list[dict]]:
         """执行带重试机制的流式 HTTP 请求"""
         timeout = httpx.Timeout(connect=6.0, read=120.0, write=10.0, pool=None)
 
@@ -260,7 +317,7 @@ class GrokSearchProvider(BaseSearchProvider):
                         json=payload,
                     ) as response:
                         response.raise_for_status()
-                        return await self._parse_streaming_response(response, ctx)
+                        return await self._parse_streaming_response(response, ctx, include_sources=include_sources)
 
     async def describe_url(self, url: str, ctx=None) -> dict:
         """让 Grok 阅读单个 URL 并返回 title + extracts"""
